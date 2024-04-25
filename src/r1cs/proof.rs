@@ -4,6 +4,7 @@
 use curve25519_dalek::ristretto::CompressedRistretto;
 use curve25519_dalek::scalar::Scalar;
 use curve25519_dalek::traits::{Identity, IsIdentity};
+use group::ff::PrimeField;
 
 use crate::errors::R1CSError;
 use crate::inner_product_proof::InnerProductProof;
@@ -177,9 +178,9 @@ impl R1CSProof {
         let T_4 = CompressedRistretto(read32!());
         let T_5 = CompressedRistretto(read32!());
         let T_6 = CompressedRistretto(read32!());
-        let t_x = Scalar::from_canonical_bytes(read32!()).ok_or(R1CSError::FormatError)?;
-        let t_x_blinding = Scalar::from_canonical_bytes(read32!()).ok_or(R1CSError::FormatError)?;
-        let e_blinding = Scalar::from_canonical_bytes(read32!()).ok_or(R1CSError::FormatError)?;
+        let t_x = Scalar::from_repr_vartime(read32!()).ok_or(R1CSError::FormatError)?;
+        let t_x_blinding = Scalar::from_repr_vartime(read32!()).ok_or(R1CSError::FormatError)?;
+        let e_blinding = Scalar::from_repr_vartime(read32!()).ok_or(R1CSError::FormatError)?;
 
         // XXX: IPPProof from_bytes gives ProofError.
         let ipp_proof = InnerProductProof::from_bytes(slice).map_err(|_| R1CSError::FormatError)?;
