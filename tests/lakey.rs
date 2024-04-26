@@ -23,7 +23,8 @@ const LATTICE_DIM: usize = 512;
 const ROW_COUNT: usize = 32;
 const LOG2Q: usize = 12;
 const LOG2P: usize = 8;
-const MAX_INT_SIZE: usize = 2 * LOG2Q + LOG2P.ilog2() as usize + LOG2P.is_power_of_two() as usize;
+const MAX_INT_SIZE: usize =
+    2 * LOG2Q + LATTICE_DIM.ilog2() as usize + !LATTICE_DIM.is_power_of_two() as usize;
 
 /// Hash input `x` onto a matrix of size `l x dim`.
 pub fn lakey_hash(x: &[u8]) -> Result<Vec<Vec<Scalar>>, Box<dyn Error>> {
@@ -65,16 +66,7 @@ fn mat_mul<T: Copy, U: Default + Add<Output = U> + Mul<Scalar, Output = U> + Fro
 }
 
 fn u64_from_scalar(x: Scalar) -> u64 {
-    x.as_bytes()
-        .iter()
-        .enumerate()
-        .map(|(i, &xi)| {
-            if i >= u64::BITS as usize / 8 && xi != 0 {
-                panic!("Scalar is too large to fit in u64");
-            }
-            u64::from(xi) * (1 << i)
-        })
-        .sum()
+    lakey_acc(x.as_bytes(), 1 << u8::BITS)
 }
 
 fn bin(x: Scalar) -> Vec<Scalar> {
@@ -89,36 +81,29 @@ fn bin_equality_gadget<CS: ConstraintSystem>(
     x: &LinearCombination,
     x_val: Option<Scalar>,
 ) -> Result<Vec<Variable>, R1CSError> {
-    let mut x = x.clone();
-    let mut exp_2 = Scalar::ONE;
-    let mut bit_vars = vec![];
-    for i in 0..MAX_INT_SIZE {
-        // Create low-level variables and add them to constraints
-        let (a, b, o) = cs.allocate_multiplier(x_val.as_ref().map(|q| {
-            let bit = (u64_from_scalar(*q) >> i) & 1;
-            ((1 - bit).into(), bit.into())
-        }))?;
+    let x_bits: Vec<Variable> = (0..MAX_INT_SIZE)
+        .map(|i| {
+            // Create low-level variables and add them to constraints
+            let (a, b, o) = cs.allocate_multiplier(x_val.as_ref().map(|q| {
+                let bit = (u64_from_scalar(*q) >> i) & 1;
+                ((1 - bit).into(), bit.into())
+            }))?;
 
-        // Enforce a * b = 0, so one of (a,b) is zero
-        cs.constrain(o.into());
+            // Enforce a * b = 0, so one of (a,b) is zero
+            cs.constrain(o.into());
 
-        // Enforce that a = 1 - b, so they both are 1 or 0.
-        cs.constrain(a + (b - 1u64));
+            // Enforce that a = 1 - b, so they both are 1 or 0.
+            cs.constrain(a + (b - 1u64));
 
-        // Add `-b_i*2^i` to the linear combination
-        // in order to form the following constraint by the end of the loop:
-        // x = Sum(b_i * 2^i, i = 0..n-1)
-        x = x - b * exp_2;
-
-        bit_vars.push(b);
-
-        exp_2 = exp_2 + exp_2;
-    }
+            Ok(b)
+        })
+        .collect::<Result<_, R1CSError>>()?;
 
     // Enforce that x = Sum(b_i * 2^i, i = 0..n-1)
-    cs.constrain(x);
+    let x_acc: LinearCombination = lakey_acc(&x_bits, Scalar::from(2u64));
+    cs.constrain(x.clone() - x_acc);
 
-    Ok(bit_vars)
+    Ok(x_bits)
 }
 
 fn lakey_trunc(x: &[Vec<Variable>]) -> Vec<LinearCombination> {
@@ -128,22 +113,27 @@ fn lakey_trunc(x: &[Vec<Variable>]) -> Vec<LinearCombination> {
                 .iter()
                 .map(|v| LinearCombination::from(*v))
                 .collect();
-            lakey_acc(&y2, 2u64.into())
+            lakey_acc(&y2, Scalar::from(2u64))
         })
         .collect()
 }
 
-fn lakey_acc<T: Add<Output = T> + Mul<Scalar, Output = T> + Default + Clone>(
-    x: &[T],
-    base: Scalar,
+fn lakey_acc<
+    U: Clone,
+    V: Clone + Mul<Output = V>,
+    T: From<U> + Add<Output = T> + Mul<V, Output = T> + Default + Clone,
+>(
+    x: &[U],
+    base: V,
 ) -> T {
     if x.len() > u64::BITS as usize {
         panic!("Input is too large");
     }
-    let mut a = Scalar::ONE;
-    x.iter().fold(T::default(), |acc, xi| {
-        let acc = acc + xi.clone() * a;
-        a = a * base;
+    let init = T::from(x[0].clone());
+    let mut a = base.clone();
+    x[1..].iter().fold(init, |acc, xi| {
+        let acc = acc + T::from(xi.clone()) * a.clone();
+        a = a.clone() * base.clone();
         acc
     })
 }
@@ -172,7 +162,7 @@ fn lakey_gadget<CS: ConstraintSystem>(
     };
 
     let Y2: Vec<LinearCombination> = lakey_trunc(&Y1_bits);
-    let Y3: LinearCombination = lakey_acc(&Y2, (1u64 << LOG2P).into());
+    let Y3: LinearCombination = lakey_acc(&Y2, Scalar::from(1u64 << LOG2P));
 
     cs.constrain(Y - Y3); // Y == Y3
 }
@@ -256,7 +246,7 @@ struct KeyPair {
 
 fn lakey_keygen<R: CryptoRngCore>(rng: &mut R) -> KeyPair {
     let pc_gens = PedersenGens::default();
-    let bp_gens = BulletproofGens::new(1024, 1);
+    let bp_gens = BulletproofGens::new(2048, 1);
 
     let q = 1 << LOG2Q;
     if q > u64::MAX {
@@ -293,7 +283,7 @@ fn lakey_trunc_scalar(x: &[Scalar]) -> Vec<Scalar> {
         .map(|xi| {
             let xi_bits = bin(*xi);
             let xi_trunc = &xi_bits[LOG2Q - LOG2P..LOG2Q];
-            lakey_acc(xi_trunc, 2u64.into())
+            lakey_acc(xi_trunc, Scalar::from(2u64))
         })
         .collect()
 }
@@ -308,7 +298,7 @@ fn lakey_eval(k: &PrivateKey, x: &[u8]) -> EvalResult {
     let A = lakey_hash(x).unwrap();
     let y1 = mat_mul(&A, &k.k);
     let y2 = lakey_trunc_scalar(&y1);
-    let y: Scalar = lakey_acc(&y2, (1u64 << LOG2P).into());
+    let y: Scalar = lakey_acc(&y2, Scalar::from(1u64 << LOG2P));
     let Y = k.pc_gens.commit(y, Scalar::ZERO).compress();
     let proof = lakey_gadget_proof(&k.pc_gens, &k.bp_gens, &k.k, &k.K_open, x, y).unwrap();
     EvalResult { y, Y, proof }
