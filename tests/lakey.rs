@@ -8,6 +8,7 @@ extern crate rand;
 use std::convert::TryInto;
 use std::error::Error;
 use std::ops::{Add, Mul};
+use std::time::Instant;
 
 use bulletproofs::r1cs::*;
 use bulletproofs::{BulletproofGens, PedersenGens};
@@ -66,7 +67,13 @@ fn mat_mul<T: Copy, U: Default + Add<Output = U> + Mul<Scalar, Output = U> + Fro
 }
 
 fn u64_from_scalar(x: Scalar) -> u64 {
-    lakey_acc(x.as_bytes(), 1 << u8::BITS)
+    let b = x.as_bytes();
+    let u64_len = u64::BITS as usize / 8;
+    if b[u64_len..].iter().any(|bi| *bi != 0) {
+        panic!("Input is too large");
+    }
+
+    lakey_acc(&b[..u64_len], 1u64 << u8::BITS)
 }
 
 fn bin(x: Scalar) -> Vec<Scalar> {
@@ -129,11 +136,15 @@ fn lakey_acc<
     if x.len() > u64::BITS as usize {
         panic!("Input is too large");
     }
-    let init = T::from(x[0].clone());
+    let (head, tail) = (&x[0], &x[1..]);
+    let init = T::from(head.clone());
     let mut a = base.clone();
-    x[1..].iter().fold(init, |acc, xi| {
+    tail.iter().enumerate().fold(init, |acc, (i, xi)| {
         let acc = acc + T::from(xi.clone()) * a.clone();
-        a = a.clone() * base.clone();
+        // Skip to prevent overflow.
+        if i != tail.len() - 1 {
+            a = a.clone() * base.clone();
+        }
         acc
     })
 }
@@ -318,15 +329,21 @@ fn lakey_gadget_test() {
     let mut rng = thread_rng();
 
     // Key generation.
+    let start = Instant::now();
     let key_pair = lakey_keygen(&mut rng);
+    println!("Key generation time: {:?}", start.elapsed());
 
     // Evaluation.
     let x = rng.next_u64().to_be_bytes();
+    let start = Instant::now();
     let y = lakey_eval(&key_pair.private, &x);
-    println!("PRF output: {:?}", y.y);
+    println!("Eval time: {:?}", start.elapsed());
+    println!("PRF output: {:?}", y.y.as_bytes());
     println!("Proof size: {:?}", y.proof.serialized_size());
 
+    let start = Instant::now();
     assert!(lakey_verify(&key_pair.public, &x, y.Y, y.proof.clone()).is_ok());
+    println!("Verify time: {:?}", start.elapsed());
 
     let Y_err = y.Y.decompress().unwrap().mul(Scalar::from(2u64)).compress();
     assert!(lakey_verify(&key_pair.public, &x, Y_err, y.proof).is_err());
