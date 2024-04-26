@@ -8,6 +8,7 @@ extern crate rand;
 use std::convert::TryInto;
 use std::error::Error;
 use std::iter::FromIterator;
+use std::ops::{Add, Mul};
 
 use bulletproofs::r1cs::*;
 use bulletproofs::{BulletproofGens, PedersenGens};
@@ -16,6 +17,7 @@ use curve25519_dalek::scalar::Scalar;
 use merlin::Transcript;
 use rand::{thread_rng, RngCore, SeedableRng};
 use rand_chacha::ChaChaRng;
+use rand_core::CryptoRngCore;
 use sha3::{Digest, Sha3_256};
 
 const LATTICE_DIM: usize = 512;
@@ -25,12 +27,10 @@ const LOG2P: usize = 8;
 const MAX_INT_SIZE: usize = 2 * LOG2Q + LOG2P.ilog2() as usize + LOG2P.is_power_of_two() as usize;
 
 /// Hash input `x` onto a matrix of size `l x dim`.
-pub fn lakey_hash<D: Digest, R: RngCore + SeedableRng<Seed = [u8; 32]>>(
-    x: &[u8],
-) -> Result<Vec<Vec<Scalar>>, Box<dyn Error>> {
+pub fn lakey_hash(x: &[u8]) -> Result<Vec<Vec<Scalar>>, Box<dyn Error>> {
     // Derive PRG seed from `x`.
-    let hash = D::digest(x);
-    let mut rng = R::from_seed(hash.as_slice().try_into()?);
+    let hash = Sha3_256::digest(x);
+    let mut rng = ChaChaRng::from_seed(hash.as_slice().try_into()?);
 
     // Generate matrix from PRG.
     let l = ROW_COUNT;
@@ -88,14 +88,10 @@ fn u64_from_scalar(x: &Scalar) -> u64 {
         .sum()
 }
 
-fn bin(x: &Vec<Scalar>) -> Vec<Vec<Scalar>> {
-    x.iter()
-        .map(|xi| {
-            let xi_u64 = u64_from_scalar(xi);
-            (0..MAX_INT_SIZE)
-                .map(|i| ((xi_u64 >> i) & 1).into())
-                .collect()
-        })
+fn bin(x: &Scalar) -> Vec<Scalar> {
+    let x_u64 = u64_from_scalar(x);
+    (0..MAX_INT_SIZE)
+        .map(|i| ((x_u64 >> i) & 1).into())
         .collect()
 }
 
@@ -137,27 +133,31 @@ fn bin_equality_gadget<CS: ConstraintSystem>(
     bit_vars
 }
 
-fn lakey_trunc(x: &Vec<Vec<Variable>>) -> Vec<LinearCombination> {
+fn lakey_trunc(x: &[Vec<Variable>]) -> Vec<LinearCombination> {
     x.iter()
         .map(|y| {
             let y2: Vec<LinearCombination> = y[LOG2Q - LOG2P..LOG2Q]
                 .iter()
                 .map(|v| LinearCombination::from(*v))
                 .collect();
-            lakey_acc(&y2)
+            lakey_acc(&y2, 2u64.into())
         })
         .collect()
 }
 
-fn lakey_acc(x: &[LinearCombination]) -> LinearCombination {
+fn lakey_acc<T: Add<Output = T> + Mul<Scalar, Output = T> + Default + Clone>(
+    x: &[T],
+    base: Scalar,
+) -> T {
     if x.len() > u64::BITS as usize {
         panic!("Input is too large");
     }
-    x.iter()
-        .enumerate()
-        .fold(LinearCombination::default(), |acc, (i, xi)| {
-            acc + Scalar::from(1u64 << i) * xi.clone()
-        })
+    let mut a = Scalar::ONE;
+    x.iter().fold(T::default(), |acc, xi| {
+        let acc = acc + xi.clone() * a;
+        a = a * base;
+        acc
+    })
 }
 
 /// Constrains Y = G * F(k, x) && K == Com(k), where F(k, x) = Acc(Trunc(H(x) * k)).
@@ -168,12 +168,12 @@ fn lakey_gadget<CS: ConstraintSystem>(
     x: &[u8],
     Y: Variable,
 ) {
-    let A: Vec<Vec<Scalar>> = lakey_hash::<Sha3_256, ChaChaRng>(x).unwrap();
+    let A: Vec<Vec<Scalar>> = lakey_hash(x).unwrap();
     let Y1: Vec<LinearCombination> = mat_mul_var(&A, K);
 
     let y1_bits: Vec<Option<Vec<Scalar>>> = if let Some(k) = k {
         let y1: Vec<Scalar> = mat_mul_scalar(&A, k);
-        let y1_bits: Vec<Vec<Scalar>> = bin(&y1);
+        let y1_bits: Vec<Vec<Scalar>> = y1.iter().map(bin).collect();
         y1_bits.into_iter().map(|x| Some(x)).collect::<Vec<_>>()
     } else {
         (0..ROW_COUNT).map(|_| None).collect()
@@ -187,7 +187,7 @@ fn lakey_gadget<CS: ConstraintSystem>(
         .collect();
 
     let Y2: Vec<LinearCombination> = lakey_trunc(&Y1_bits);
-    let Y3: LinearCombination = lakey_acc(&Y2);
+    let Y3: LinearCombination = lakey_acc(&Y2, (1u64 << LOG2P).into());
 
     cs.constrain(Y - Y3); // Y == Y3
 }
@@ -200,7 +200,6 @@ fn lakey_gadget_proof(
     K_open: &[Scalar],
     x: &[u8],
     y: Scalar,
-    Y_open: Scalar,
 ) -> Result<R1CSProof, R1CSError> {
     let mut transcript = Transcript::new(b"R1CSLakeyGadget");
 
@@ -208,16 +207,12 @@ fn lakey_gadget_proof(
     let mut prover = Prover::new(pc_gens, &mut transcript);
 
     // 2. Commit high-level variables
-    // let (commitments, vars): (Vec<_>, Vec<_>) = [a1, a2, b1, b2, c1]
-    //     .into_iter()
-    //     .map(|x| prover.commit(Scalar::from(*x), Scalar::random(&mut thread_rng())))
-    //     .unzip();
     let (_, K_vars): (Vec<_>, Vec<_>) = k
         .iter()
         .zip(K_open)
         .map(|(ki, ri)| prover.commit(*ki, *ri))
         .unzip();
-    let (_, Y_var) = prover.commit(y, Y_open);
+    let (_, Y_var) = prover.commit(y, Scalar::ZERO);
 
     // 3. Build a CS
     lakey_gadget(&mut prover, &K_vars, Some(k), x, Y_var);
@@ -256,58 +251,108 @@ fn lakey_gadget_verify(
         .map_err(|_| R1CSError::VerificationError)
 }
 
-fn lakey_gadget_roundtrip_helper(
-    k: &[Scalar],
-    K: &[CompressedRistretto],
-    K_open: &Vec<Scalar>,
-    x: &[u8],
-    y: Scalar,
-    Y: CompressedRistretto,
-    Y_open: Scalar,
-) -> Result<(), R1CSError> {
-    // Common
-    let pc_gens = PedersenGens::default();
-    let bp_gens = BulletproofGens::new(128, 1);
-
-    let proof = lakey_gadget_proof(&pc_gens, &bp_gens, k, &K_open, x, y, Y_open)?;
-
-    lakey_gadget_verify(&pc_gens, &bp_gens, K, x, Y, proof)
+struct PrivateKey {
+    k: Vec<Scalar>,
+    K_open: Vec<Scalar>,
+    pc_gens: PedersenGens,
+    bp_gens: BulletproofGens,
 }
 
-fn lakey_gadget_roundtrip_serialization_helper(
-    k: &[Scalar],
-    K: &[CompressedRistretto],
-    K_open: &Vec<Scalar>,
-    x: &[u8],
+struct PublicKey {
+    K: Vec<CompressedRistretto>,
+    pc_gens: PedersenGens,
+    bp_gens: BulletproofGens,
+}
+
+struct KeyPair {
+    private: PrivateKey,
+    public: PublicKey,
+}
+
+fn lakey_keygen<R: CryptoRngCore>(rng: &mut R) -> KeyPair {
+    let pc_gens = PedersenGens::default();
+    let bp_gens = BulletproofGens::new(1024, 1);
+
+    let q = 1 << LOG2Q;
+    if q > u64::MAX {
+        panic!("q is too large");
+    }
+    let k = (0..LATTICE_DIM)
+        .map(|_| (rng.next_u64() % q).into())
+        .collect::<Vec<_>>();
+    let K_open = (0..LATTICE_DIM)
+        .map(|_| Scalar::random(rng))
+        .collect::<Vec<_>>();
+    let K = k
+        .iter()
+        .zip(K_open.iter())
+        .map(|(ki, ri)| pc_gens.commit(*ki, *ri).compress())
+        .collect::<Vec<_>>();
+    KeyPair {
+        private: PrivateKey {
+            k,
+            K_open,
+            pc_gens,
+            bp_gens: bp_gens.clone(),
+        },
+        public: PublicKey {
+            K,
+            pc_gens,
+            bp_gens,
+        },
+    }
+}
+
+fn lakey_trunc_scalar(x: &[Scalar]) -> Vec<Scalar> {
+    x.iter()
+        .map(|xi| {
+            let xi_bits = bin(xi);
+            let xi_trunc = &xi_bits[LOG2Q - LOG2P..LOG2Q];
+            lakey_acc(xi_trunc, 2u64.into())
+        })
+        .collect()
+}
+
+struct EvalResult {
     y: Scalar,
     Y: CompressedRistretto,
-    Y_open: Scalar,
+    proof: R1CSProof,
+}
+
+fn lakey_eval(k: &PrivateKey, x: &[u8]) -> EvalResult {
+    let A = lakey_hash(x).unwrap();
+    let y1 = mat_mul_scalar(&A, &k.k);
+    let y2 = lakey_trunc_scalar(&y1);
+    let y: Scalar = lakey_acc(&y2, (1u64 << LOG2P).into());
+    let Y = k.pc_gens.commit(y, Scalar::ZERO).compress();
+    let proof = lakey_gadget_proof(&k.pc_gens, &k.bp_gens, &k.k, &k.K_open, x, y).unwrap();
+    EvalResult { y, Y, proof }
+}
+
+fn lakey_verify(
+    k: &PublicKey,
+    x: &[u8],
+    Y: CompressedRistretto,
+    proof: R1CSProof,
 ) -> Result<(), R1CSError> {
-    // Common
-    let pc_gens = PedersenGens::default();
-    let bp_gens = BulletproofGens::new(128, 1);
-
-    let proof = lakey_gadget_proof(&pc_gens, &bp_gens, k, &K_open, x, y, Y_open)?;
-
-    let proof = proof.to_bytes();
-
-    let proof = R1CSProof::from_bytes(&proof)?;
-
-    lakey_gadget_verify(&pc_gens, &bp_gens, K, x, Y, proof)
+    lakey_gadget_verify(&k.pc_gens, &k.bp_gens, &k.K, x, Y, proof)
 }
 
 #[test]
 fn lakey_gadget_test() {
-    // (3 + 4) * (6 + 1) = (40 + 9)
-    assert!(lakey_gadget_roundtrip_helper(3, 4, 6, 1, 40, 9).is_ok());
-    // (3 + 4) * (6 + 1) != (40 + 10)
-    assert!(lakey_gadget_roundtrip_helper(3, 4, 6, 1, 40, 10).is_err());
-}
+    let mut rng = thread_rng();
 
-#[test]
-fn lakey_gadget_serialization_test() {
-    // (3 + 4) * (6 + 1) = (40 + 9)
-    assert!(lakey_gadget_roundtrip_serialization_helper(3, 4, 6, 1, 40, 9).is_ok());
-    // (3 + 4) * (6 + 1) != (40 + 10)
-    assert!(lakey_gadget_roundtrip_serialization_helper(3, 4, 6, 1, 40, 10).is_err());
+    // Key generation.
+    let key_pair = lakey_keygen(&mut rng);
+
+    // Evaluation.
+    let x = rng.next_u64().to_be_bytes();
+    let y = lakey_eval(&key_pair.private, &x);
+    println!("PRF output: {:?}", y.y);
+    println!("Proof size: {:?}", y.proof.serialized_size());
+
+    assert!(lakey_verify(&key_pair.public, &x, y.Y, y.proof.clone()).is_ok());
+
+    let Y_err = y.Y.decompress().unwrap().mul(Scalar::from(2u64)).compress();
+    assert!(lakey_verify(&key_pair.public, &x, Y_err, y.proof).is_err());
 }
