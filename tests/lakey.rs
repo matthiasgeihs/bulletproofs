@@ -7,7 +7,6 @@ extern crate rand;
 
 use std::convert::TryInto;
 use std::error::Error;
-use std::iter::FromIterator;
 use std::ops::{Add, Mul};
 
 use bulletproofs::r1cs::*;
@@ -65,7 +64,7 @@ fn mat_mul<T: Copy, U: Default + Add<Output = U> + Mul<Scalar, Output = U> + Fro
         .collect::<Vec<_>>()
 }
 
-fn u64_from_scalar(x: &Scalar) -> u64 {
+fn u64_from_scalar(x: Scalar) -> u64 {
     x.as_bytes()
         .iter()
         .enumerate()
@@ -78,7 +77,7 @@ fn u64_from_scalar(x: &Scalar) -> u64 {
         .sum()
 }
 
-fn bin(x: &Scalar) -> Vec<Scalar> {
+fn bin(x: Scalar) -> Vec<Scalar> {
     let x_u64 = u64_from_scalar(x);
     (0..MAX_INT_SIZE)
         .map(|i| ((x_u64 >> i) & 1).into())
@@ -87,19 +86,18 @@ fn bin(x: &Scalar) -> Vec<Scalar> {
 
 fn bin_equality_gadget<CS: ConstraintSystem>(
     cs: &mut CS,
-    mut x: LinearCombination,
-    x_bits: Option<Vec<Scalar>>,
-) -> Vec<Variable> {
+    x: &LinearCombination,
+    x_val: Option<Scalar>,
+) -> Result<Vec<Variable>, R1CSError> {
+    let mut x = x.clone();
     let mut exp_2 = Scalar::ONE;
     let mut bit_vars = vec![];
     for i in 0..MAX_INT_SIZE {
         // Create low-level variables and add them to constraints
-        let (a, b, o) = cs
-            .allocate_multiplier(x_bits.as_ref().map(|q| {
-                let bit = q[i];
-                (Scalar::from(1u64) - bit, bit)
-            }))
-            .unwrap();
+        let (a, b, o) = cs.allocate_multiplier(x_val.as_ref().map(|q| {
+            let bit = (u64_from_scalar(*q) >> i) & 1;
+            ((1 - bit).into(), bit.into())
+        }))?;
 
         // Enforce a * b = 0, so one of (a,b) is zero
         cs.constrain(o.into());
@@ -120,7 +118,7 @@ fn bin_equality_gadget<CS: ConstraintSystem>(
     // Enforce that x = Sum(b_i * 2^i, i = 0..n-1)
     cs.constrain(x);
 
-    bit_vars
+    Ok(bit_vars)
 }
 
 fn lakey_trunc(x: &[Vec<Variable>]) -> Vec<LinearCombination> {
@@ -161,20 +159,17 @@ fn lakey_gadget<CS: ConstraintSystem>(
     let A: Vec<Vec<Scalar>> = lakey_hash(x).unwrap();
     let Y1: Vec<LinearCombination> = mat_mul(&A, K);
 
-    let y1_bits: Vec<Option<Vec<Scalar>>> = if let Some(k) = k {
+    let Y1_bits: Vec<Vec<Variable>> = if let Some(k) = k {
         let y1: Vec<Scalar> = mat_mul(&A, k);
-        let y1_bits: Vec<Vec<Scalar>> = y1.iter().map(bin).collect();
-        y1_bits.into_iter().map(|x| Some(x)).collect::<Vec<_>>()
+        Y1.iter()
+            .zip(y1.iter())
+            .map(|(a, b)| bin_equality_gadget(cs, a, Some(*b)).unwrap())
+            .collect()
     } else {
-        (0..ROW_COUNT).map(|_| None).collect()
+        Y1.iter()
+            .map(|a| bin_equality_gadget(cs, a, None).unwrap())
+            .collect()
     };
-
-    // Y1 == Com(Acc(y1_bits)) && y1_bits in {0,1}^*
-    let Y1_bits: Vec<Vec<Variable>> = Y1
-        .iter()
-        .zip(y1_bits)
-        .map(|(yi, yi_bits)| bin_equality_gadget(cs, yi.clone(), yi_bits))
-        .collect();
 
     let Y2: Vec<LinearCombination> = lakey_trunc(&Y1_bits);
     let Y3: LinearCombination = lakey_acc(&Y2, (1u64 << LOG2P).into());
@@ -296,7 +291,7 @@ fn lakey_keygen<R: CryptoRngCore>(rng: &mut R) -> KeyPair {
 fn lakey_trunc_scalar(x: &[Scalar]) -> Vec<Scalar> {
     x.iter()
         .map(|xi| {
-            let xi_bits = bin(xi);
+            let xi_bits = bin(*xi);
             let xi_trunc = &xi_bits[LOG2Q - LOG2P..LOG2Q];
             lakey_acc(xi_trunc, 2u64.into())
         })
