@@ -49,28 +49,18 @@ pub fn lakey_hash(x: &[u8]) -> Result<Vec<Vec<Scalar>>, Box<dyn Error>> {
     Ok(rows)
 }
 
-fn mat_mul_var(A: &Vec<Vec<Scalar>>, K: &[Variable]) -> Vec<LinearCombination> {
-    A.iter()
+fn mat_mul<T: Copy, U: Default + Add<Output = U> + Mul<Scalar, Output = U> + From<T>>(
+    m: &Vec<Vec<Scalar>>,
+    v: &[T],
+) -> Vec<U> {
+    m.iter()
         .map(|ai| {
-            if ai.len() != K.len() {
+            if ai.len() != v.len() {
                 panic!("Matrix and vector dimensions do not match");
             }
-            let it = ai
-                .iter()
-                .zip(K.iter())
-                .map(|(aij, kj)| (kj.clone(), aij.clone()));
-            LinearCombination::from_iter(it)
-        })
-        .collect::<Vec<_>>()
-}
-
-fn mat_mul_scalar(A: &Vec<Vec<Scalar>>, k: &[Scalar]) -> Vec<Scalar> {
-    A.iter()
-        .map(|ai| {
-            if ai.len() != k.len() {
-                panic!("Matrix and vector dimensions do not match");
-            }
-            ai.iter().zip(k.iter()).map(|(aij, kj)| aij * kj).sum()
+            ai.iter()
+                .zip(v.iter())
+                .fold(U::default(), |acc, (aij, kj)| acc + U::from(*kj) * *aij)
         })
         .collect::<Vec<_>>()
 }
@@ -169,17 +159,17 @@ fn lakey_gadget<CS: ConstraintSystem>(
     Y: Variable,
 ) {
     let A: Vec<Vec<Scalar>> = lakey_hash(x).unwrap();
-    let Y1: Vec<LinearCombination> = mat_mul_var(&A, K);
+    let Y1: Vec<LinearCombination> = mat_mul(&A, K);
 
     let y1_bits: Vec<Option<Vec<Scalar>>> = if let Some(k) = k {
-        let y1: Vec<Scalar> = mat_mul_scalar(&A, k);
+        let y1: Vec<Scalar> = mat_mul(&A, k);
         let y1_bits: Vec<Vec<Scalar>> = y1.iter().map(bin).collect();
         y1_bits.into_iter().map(|x| Some(x)).collect::<Vec<_>>()
     } else {
         (0..ROW_COUNT).map(|_| None).collect()
     };
 
-    // let Y1_bits: Vec<Vec<Variable>> = bin_equality_gadget(cs, Y1, y1_bits); // Y1 == Com(Acc(y1_bits)) && y1_bits in {0,1}^*
+    // Y1 == Com(Acc(y1_bits)) && y1_bits in {0,1}^*
     let Y1_bits: Vec<Vec<Variable>> = Y1
         .iter()
         .zip(y1_bits)
@@ -321,7 +311,7 @@ struct EvalResult {
 
 fn lakey_eval(k: &PrivateKey, x: &[u8]) -> EvalResult {
     let A = lakey_hash(x).unwrap();
-    let y1 = mat_mul_scalar(&A, &k.k);
+    let y1 = mat_mul(&A, &k.k);
     let y2 = lakey_trunc_scalar(&y1);
     let y: Scalar = lakey_acc(&y2, (1u64 << LOG2P).into());
     let Y = k.pc_gens.commit(y, Scalar::ZERO).compress();
